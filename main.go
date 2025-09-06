@@ -13,10 +13,16 @@ import (
 type MessageType string
 
 const (
-	MsgInit   MessageType = "init"
-	MsgInitOk MessageType = "init_ok"
-	MsgEcho   MessageType = "echo"
-	MsgEchoOk MessageType = "echo_ok"
+	MsgInit        MessageType = "init"
+	MsgInitOk      MessageType = "init_ok"
+	MsgEcho        MessageType = "echo"
+	MsgEchoOk      MessageType = "echo_ok"
+	MsgTopology    MessageType = "topology"
+	MsgTopologyOk  MessageType = "topology_ok"
+	MsgBroadcast   MessageType = "broadcast"
+	MsgBroadcastOk MessageType = "broadcast_ok"
+	MsgRead        MessageType = "read"
+	MsgReadOk      MessageType = "read_ok"
 )
 
 var log = logrus.New()
@@ -56,19 +62,40 @@ type EchoBody struct {
 	Echo string `json:"echo"`
 }
 
+type TopologyBody struct {
+	BaseBody
+	Neighbours map[string][]string `json:"topology,omitempty"`
+}
+
+type BroadcastBody struct {
+	BaseBody
+	Message int `json:"message,omitempty"`
+}
+
+type ReadBody struct {
+	BaseBody
+	Messages []int `json:"messages,omitempty"`
+}
+
 type Node struct {
-	id     string
-	reader io.Reader
-	writer io.Writer
-	msgID  int
+	id         string
+	nodeIDs    []string
+	neighbours []string
+	reader     io.Reader
+	writer     io.Writer
+	msgID      int
+	store      []int
 }
 
 func NewNode(nodeID string) *Node {
 	return &Node{
-		id:     nodeID,
-		reader: os.Stdin,
-		writer: os.Stdout,
-		msgID:  1,
+		id:         nodeID,
+		nodeIDs:    []string{},
+		neighbours: []string{},
+		reader:     os.Stdin,
+		writer:     os.Stdout,
+		msgID:      1,
+		store:      []int{},
 	}
 }
 
@@ -140,6 +167,27 @@ func (n *Node) parseMessageBody(msgType MessageType, rawBody map[string]any) (Me
 		}
 		return &body, nil
 
+	case MsgTopology:
+		var body TopologyBody
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			return nil, err
+		}
+		return &body, nil
+
+	case MsgBroadcast:
+		var body BroadcastBody
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			return nil, err
+		}
+		return &body, nil
+
+	case MsgRead:
+		var body ReadBody
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			return nil, err
+		}
+		return &body, nil
+
 	default:
 		return nil, fmt.Errorf("unknown message type: %s", msgType)
 	}
@@ -147,6 +195,7 @@ func (n *Node) parseMessageBody(msgType MessageType, rawBody map[string]any) (Me
 }
 
 func (n *Node) handleMessage(msg Message) error {
+	log.WithField("node store", n.store).Debug("Data")
 	body, ok := msg.Body.(MessageBody)
 	if !ok {
 		return fmt.Errorf("invalid message body type")
@@ -157,6 +206,12 @@ func (n *Node) handleMessage(msg Message) error {
 		return n.handleInit(msg, body.(*InitBody))
 	case MsgEcho:
 		return n.handleEcho(msg, body.(*EchoBody))
+	case MsgTopology:
+		return n.handleTopology(msg, body.(*TopologyBody))
+	case MsgBroadcast:
+		return n.handleBroadcast(msg, body.(*BroadcastBody))
+	case MsgRead:
+		return n.handleRead(msg, body.(*ReadBody))
 	default:
 		return fmt.Errorf("unhandled message type: %s", body.GetType())
 	}
@@ -164,6 +219,7 @@ func (n *Node) handleMessage(msg Message) error {
 
 func (n *Node) handleInit(msg Message, body *InitBody) error {
 	log.WithField("node_id", body.NodeID).Info("Received init message")
+	n.nodeIDs = body.NodeIDs
 	response := &InitBody{
 		BaseBody: BaseBody{
 			Type:    MsgInitOk,
@@ -175,7 +231,7 @@ func (n *Node) handleInit(msg Message, body *InitBody) error {
 }
 
 func (n *Node) handleEcho(msg Message, body *EchoBody) error {
-	log.WithField("node_id", body.Echo).Info("Received echo message")
+	log.WithField("echo message", body.Echo).Info("Received echo message")
 	response := &EchoBody{
 		BaseBody: BaseBody{
 			Type:    MsgEchoOk,
@@ -183,6 +239,44 @@ func (n *Node) handleEcho(msg Message, body *EchoBody) error {
 			ReplyTo: body.MsgID,
 		},
 		Echo: body.Echo,
+	}
+	return n.sendReply(msg.Source, response)
+}
+
+func (n *Node) handleTopology(msg Message, body *TopologyBody) error {
+	log.WithField("neighbours", body.Neighbours).Info("Received neighbours message")
+	n.neighbours = body.Neighbours[n.id]
+	response := &TopologyBody{
+		BaseBody: BaseBody{
+			Type:    MsgTopologyOk,
+			MsgID:   n.nextMsgID(),
+			ReplyTo: body.MsgID,
+		},
+	}
+	return n.sendReply(msg.Source, response)
+}
+
+func (n *Node) handleBroadcast(msg Message, body *BroadcastBody) error {
+	log.WithField("message", body.Message).Info("Received message")
+	n.store = append(n.store, body.Message)
+	response := &TopologyBody{
+		BaseBody: BaseBody{
+			Type:    MsgBroadcastOk,
+			MsgID:   n.nextMsgID(),
+			ReplyTo: body.MsgID,
+		},
+	}
+	return n.sendReply(msg.Source, response)
+}
+
+func (n *Node) handleRead(msg Message, body *ReadBody) error {
+	response := &ReadBody{
+		BaseBody: BaseBody{
+			Type:    MsgReadOk,
+			MsgID:   n.nextMsgID(),
+			ReplyTo: body.MsgID,
+		},
+		Messages: n.store,
 	}
 	return n.sendReply(msg.Source, response)
 }
@@ -219,6 +313,7 @@ func main() {
 		panic("Cant create logger")
 	}
 	log.SetOutput(file)
+	log.SetLevel(logrus.DebugLevel)
 	node := NewNode("n1")
 	log.Info("Starting node")
 	if err := node.Listen(); err != nil {
